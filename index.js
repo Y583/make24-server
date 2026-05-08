@@ -468,7 +468,13 @@ app.post('/lobby/:code/finish', (req, res) => {
   if (!member) return res.status(403).json({ error: 'not in lobby' });
 
   const { time_ms, solution, round_index } = req.body || {};
-  if (!Number.isInteger(time_ms) || time_ms < MIN_TIME_MS || time_ms > MAX_TIME_MS)
+  // Lobby finishes use a relaxed time floor (100 ms) — a practiced player can
+  // genuinely solve a familiar pattern in well under the global MIN_TIME_MS.
+  // Rejecting fast lobby solves with 400 used to cascade into a poisoned-match
+  // freeze on the iOS client. The MAX bound stays the same to catch obvious
+  // tab-left-open submissions.
+  const LOBBY_MIN_TIME_MS = 100;
+  if (!Number.isInteger(time_ms) || time_ms < LOBBY_MIN_TIME_MS || time_ms > MAX_TIME_MS)
     return res.status(400).json({ error: 'bad time_ms' });
 
   // round_index is 1-based and must be this player's next expected round.
