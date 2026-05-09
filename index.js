@@ -544,6 +544,114 @@ app.post('/lobby/:code/finish', (req, res) => {
   res.json({ lobby: lobbyView(code, user.id) });
 });
 
+// Idempotent batch upsert for a player's round history. Client sends its full
+// local list of solved rounds; server applies any rounds beyond its own
+// rounds_done, validating each in order. This makes per-round delivery robust
+// to flaky networks: if every individual /finish retry burned out (which is
+// what stranded the iOS player at 9/10 from peers' perspectives), the next
+// successful /sync will catch the server fully up.
+app.post('/lobby/:code/sync', (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const code = String(req.params.code || '').toUpperCase();
+  const lobby = db.prepare('SELECT * FROM lobbies WHERE code = ?').get(code);
+  if (!lobby) {
+    console.log(`[/sync] 404 lobby_not_found user=${user.id} code=${code}`);
+    return res.status(404).json({ error: 'lobby not found' });
+  }
+  // We accept /sync against a 'done' lobby too — the last submission may
+  // arrive slightly after the lobby flipped done because some other player's
+  // submission was the one that triggered the transition.
+  if (lobby.status === 'waiting') {
+    console.log(`[/sync] 409 not_playing user=${user.id} code=${code} status=${lobby.status}`);
+    return res.status(409).json({ error: 'not playing' });
+  }
+  const member = db.prepare('SELECT * FROM lobby_members WHERE lobby_code=? AND user_id=?').get(code, user.id);
+  if (!member) {
+    console.log(`[/sync] 403 not_in_lobby user=${user.id} code=${code}`);
+    return res.status(403).json({ error: 'not in lobby' });
+  }
+
+  const { history } = req.body || {};
+  if (!Array.isArray(history)) {
+    return res.status(400).json({ error: 'bad history' });
+  }
+  const allRounds = lobby.rounds_json ? JSON.parse(lobby.rounds_json) : null;
+  if (!allRounds) {
+    return res.status(400).json({ error: 'no rounds set' });
+  }
+
+  const startingRoundsDone = member.rounds_done ?? 0;
+  let roundsDone = startingRoundsDone;
+  let totalMs = member.total_ms ?? 0;
+  let lastTimeMs = member.finish_ms ?? null;
+  const LOBBY_MIN_TIME_MS = 100;
+  const newlyAppliedNumbers = []; // for /runs inserts at the end
+
+  for (const entry of history) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { round_index, time_ms, solution } = entry;
+    if (!Number.isInteger(round_index)) continue;
+    // Idempotent: skip rounds the server has already recorded.
+    if (round_index <= roundsDone) continue;
+    if (round_index !== roundsDone + 1) {
+      console.log(`[/sync] 409 gap user=${user.id} code=${code} sent=${round_index} expected=${roundsDone + 1}`);
+      return res.status(409).json({ error: 'unexpected round_index', expected: roundsDone + 1, sent: round_index });
+    }
+    if (round_index < 1 || round_index > allRounds.length) {
+      return res.status(400).json({ error: 'bad round_index' });
+    }
+    if (!Number.isInteger(time_ms) || time_ms < LOBBY_MIN_TIME_MS || time_ms > MAX_TIME_MS) {
+      return res.status(400).json({ error: 'bad time_ms' });
+    }
+    const numbers = allRounds[round_index - 1];
+    if (!validateSolution(numbers, solution)) {
+      console.log(`[/sync] 400 invalid_solution user=${user.id} code=${code} round=${round_index}`);
+      return res.status(400).json({ error: 'invalid solution', round: round_index });
+    }
+    roundsDone = round_index;
+    totalMs += time_ms;
+    lastTimeMs = time_ms;
+    newlyAppliedNumbers.push({ round_index, numbers, time_ms });
+  }
+
+  if (roundsDone > startingRoundsDone) {
+    db.prepare(`UPDATE lobby_members
+                   SET rounds_done=?, total_ms=?, finish_ms=?, finished_at=?
+                 WHERE lobby_code=? AND user_id=?`)
+      .run(roundsDone, totalMs, lastTimeMs, Date.now(), code, user.id);
+
+    for (const r of newlyAppliedNumbers) {
+      const runId = crypto.randomUUID();
+      db.prepare(`INSERT INTO runs (id, user_id, puzzle_key, time_ms, client, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(runId, user.id, normalizeKey(r.numbers), r.time_ms, 'sync', Date.now());
+    }
+
+    // Match-completion check is identical to /finish's.
+    const roundsTotal = lobby.rounds_total ?? 1;
+    const notDoneCount = db.prepare(
+      'SELECT COUNT(*) AS n FROM lobby_members WHERE lobby_code=? AND rounds_done < ?'
+    ).get(code, roundsTotal).n;
+
+    if (notDoneCount === 0) {
+      db.prepare(`UPDATE lobbies SET status='done', round_index=?, updated_at=? WHERE code=?`)
+        .run(roundsTotal, Date.now(), code);
+    } else {
+      const maxRow = db.prepare(
+        'SELECT MAX(rounds_done) AS m FROM lobby_members WHERE lobby_code=?'
+      ).get(code);
+      db.prepare(`UPDATE lobbies SET round_index=?, updated_at=? WHERE code=?`)
+        .run(maxRow.m ?? roundsDone, Date.now(), code);
+    }
+    console.log(`[/sync] 200 user=${user.id} code=${code} prev=${startingRoundsDone} now=${roundsDone}`);
+  } else {
+    console.log(`[/sync] 200 noop user=${user.id} code=${code} rounds_done=${roundsDone}`);
+  }
+
+  res.json({ lobby: lobbyView(code, user.id) });
+});
+
 app.post('/lobby/:code/leave', (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
