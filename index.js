@@ -461,11 +461,20 @@ app.post('/lobby/:code/finish', (req, res) => {
   if (!user) return;
   const code = String(req.params.code || '').toUpperCase();
   const lobby = db.prepare('SELECT * FROM lobbies WHERE code = ?').get(code);
-  if (!lobby) return res.status(404).json({ error: 'lobby not found' });
-  if (lobby.status !== 'playing') return res.status(409).json({ error: 'not playing' });
+  if (!lobby) {
+    console.log(`[/finish] 404 lobby_not_found user=${user.id} code=${code}`);
+    return res.status(404).json({ error: 'lobby not found' });
+  }
+  if (lobby.status !== 'playing') {
+    console.log(`[/finish] 409 not_playing user=${user.id} code=${code} status=${lobby.status}`);
+    return res.status(409).json({ error: 'not playing' });
+  }
 
   const member = db.prepare('SELECT * FROM lobby_members WHERE lobby_code=? AND user_id=?').get(code, user.id);
-  if (!member) return res.status(403).json({ error: 'not in lobby' });
+  if (!member) {
+    console.log(`[/finish] 403 not_in_lobby user=${user.id} code=${code}`);
+    return res.status(403).json({ error: 'not in lobby' });
+  }
 
   const { time_ms, solution, round_index } = req.body || {};
   // Lobby finishes use a relaxed time floor (100 ms) — a practiced player can
@@ -474,20 +483,30 @@ app.post('/lobby/:code/finish', (req, res) => {
   // freeze on the iOS client. The MAX bound stays the same to catch obvious
   // tab-left-open submissions.
   const LOBBY_MIN_TIME_MS = 100;
-  if (!Number.isInteger(time_ms) || time_ms < LOBBY_MIN_TIME_MS || time_ms > MAX_TIME_MS)
+  if (!Number.isInteger(time_ms) || time_ms < LOBBY_MIN_TIME_MS || time_ms > MAX_TIME_MS) {
+    console.log(`[/finish] 400 bad_time_ms user=${user.id} code=${code} time_ms=${time_ms}`);
     return res.status(400).json({ error: 'bad time_ms' });
+  }
 
   // round_index is 1-based and must be this player's next expected round.
   const roundsDone = member.rounds_done ?? 0;
-  if (!Number.isInteger(round_index) || round_index !== roundsDone + 1)
+  if (!Number.isInteger(round_index) || round_index !== roundsDone + 1) {
+    console.log(`[/finish] 409 unexpected_round_index user=${user.id} code=${code} sent=${round_index} expected=${roundsDone + 1}`);
     return res.status(409).json({ error: 'unexpected round_index' });
+  }
 
   const allRounds = lobby.rounds_json ? JSON.parse(lobby.rounds_json) : null;
-  if (!allRounds || round_index < 1 || round_index > allRounds.length)
+  if (!allRounds || round_index < 1 || round_index > allRounds.length) {
+    console.log(`[/finish] 400 bad_round_index user=${user.id} code=${code} sent=${round_index} total=${allRounds?.length}`);
     return res.status(400).json({ error: 'bad round_index' });
+  }
 
   const numbers = allRounds[round_index - 1];
-  if (!validateSolution(numbers, solution)) return res.status(400).json({ error: 'invalid solution' });
+  if (!validateSolution(numbers, solution)) {
+    console.log(`[/finish] 400 invalid_solution user=${user.id} code=${code} round=${round_index} numbers=${JSON.stringify(numbers)} solution=${JSON.stringify(solution)}`);
+    return res.status(400).json({ error: 'invalid solution' });
+  }
+  console.log(`[/finish] 200 ok user=${user.id} code=${code} round=${round_index} time_ms=${time_ms} rounds_done_now=${round_index}`);
 
   // Advance this player's progress independently — no waiting for others.
   const newRoundsDone = round_index;
