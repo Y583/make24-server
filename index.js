@@ -5,7 +5,13 @@ import crypto from 'node:crypto';
 
 const PORT = process.env.PORT || 8787;
 const DB_PATH = process.env.DB_PATH || './make24.db';
-const MIN_TIME_MS = 1500;
+// Lower-bound on submitted solve times. Was 1500ms to keep junk scores off
+// the leaderboard, but the dev-skip flow now records real wall-clock time
+// and a fast tap (< 1.5s) was getting silently rejected as a 400 — making
+// the skip button appear "broken after one use" once the user clicked faster
+// than the prior fake 2s baseline. Bringing this in line with LOBBY_MIN_TIME_MS
+// so both code paths share the same forgiving floor.
+const MIN_TIME_MS = 1;
 const MAX_TIME_MS = 1000 * 60 * 60;
 
 // ─────────────────────────────────────────────
