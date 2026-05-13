@@ -658,6 +658,85 @@ app.post('/lobby/:code/sync', (req, res) => {
   res.json({ lobby: lobbyView(code, user.id) });
 });
 
+// Monotonic progress beacon. Client posts the integers it cares about and
+// the server takes max(stored, incoming). No solution validation, no
+// per-round history, no ordering constraints — just a pair of counters
+// that can only ever increase. This replaces /sync as the primary lobby
+// state-replication path because /sync's validation pipeline was getting
+// wedged when a single round's submission triggered a 400, blocking
+// every subsequent round behind it. Progress can't be wedged that way:
+// every successful call brings the server closer to the truth.
+//
+// Tradeoff: lobby rounds don't grant solo-leaderboard credit anymore.
+// That responsibility now belongs to /runs (which still validates).
+app.post('/lobby/:code/progress', (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const code = String(req.params.code || '').toUpperCase();
+  const lobby = db.prepare('SELECT * FROM lobbies WHERE code = ?').get(code);
+  if (!lobby) {
+    console.log(`[/progress] 404 lobby_not_found user=${user.id} code=${code}`);
+    return res.status(404).json({ error: 'lobby not found' });
+  }
+  if (lobby.status === 'waiting') {
+    console.log(`[/progress] 409 not_playing user=${user.id} code=${code}`);
+    return res.status(409).json({ error: 'not playing' });
+  }
+  const member = db.prepare('SELECT * FROM lobby_members WHERE lobby_code=? AND user_id=?').get(code, user.id);
+  if (!member) {
+    console.log(`[/progress] 403 not_in_lobby user=${user.id} code=${code}`);
+    return res.status(403).json({ error: 'not in lobby' });
+  }
+
+  const { rounds_done, total_ms, last_round_ms } = req.body || {};
+  if (!Number.isInteger(rounds_done) || rounds_done < 0) {
+    return res.status(400).json({ error: 'bad rounds_done' });
+  }
+  if (!Number.isInteger(total_ms) || total_ms < 0 || total_ms > MAX_TIME_MS * 50) {
+    return res.status(400).json({ error: 'bad total_ms' });
+  }
+
+  const roundsTotal = lobby.rounds_total ?? 1;
+  const cappedRoundsDone = Math.min(rounds_done, roundsTotal);
+  const finalRoundsDone = Math.max(member.rounds_done ?? 0, cappedRoundsDone);
+  const finalTotalMs = Math.max(member.total_ms ?? 0, total_ms);
+  const finalFinishMs = Number.isInteger(last_round_ms) ? last_round_ms : member.finish_ms;
+  const finishedAt = finalRoundsDone >= roundsTotal
+    ? (member.finished_at || Date.now())
+    : null;
+
+  const advanced =
+    finalRoundsDone > (member.rounds_done ?? 0) ||
+    finalTotalMs > (member.total_ms ?? 0);
+
+  if (advanced) {
+    db.prepare(`UPDATE lobby_members
+                   SET rounds_done=?, total_ms=?, finish_ms=?, finished_at=?
+                 WHERE lobby_code=? AND user_id=?`)
+      .run(finalRoundsDone, finalTotalMs, finalFinishMs, finishedAt, code, user.id);
+
+    const notDoneCount = db.prepare(
+      'SELECT COUNT(*) AS n FROM lobby_members WHERE lobby_code=? AND rounds_done < ?'
+    ).get(code, roundsTotal).n;
+
+    if (notDoneCount === 0) {
+      db.prepare(`UPDATE lobbies SET status='done', round_index=?, updated_at=? WHERE code=?`)
+        .run(roundsTotal, Date.now(), code);
+    } else {
+      const maxRow = db.prepare(
+        'SELECT MAX(rounds_done) AS m FROM lobby_members WHERE lobby_code=?'
+      ).get(code);
+      db.prepare(`UPDATE lobbies SET round_index=?, updated_at=? WHERE code=?`)
+        .run(maxRow.m ?? finalRoundsDone, Date.now(), code);
+    }
+    console.log(`[/progress] 200 user=${user.id} code=${code} rounds_done=${finalRoundsDone}/${roundsTotal} total_ms=${finalTotalMs}`);
+  } else {
+    console.log(`[/progress] 200 noop user=${user.id} code=${code} rounds_done=${finalRoundsDone}`);
+  }
+
+  res.json({ lobby: lobbyView(code, user.id) });
+});
+
 app.post('/lobby/:code/leave', (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
